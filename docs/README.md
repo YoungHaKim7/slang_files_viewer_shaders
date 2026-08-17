@@ -2,6 +2,49 @@
 
 - The decomposition design is ready. Here's the essence of it:
 
+- Done. The divide & conquer split is complete, compiles clean, and renders verified on both paths.
+
+## Final tree (was: 1405-line `lib.rs`)
+
+```
+src/
+├── lib.rs              47  mod decls, WIDTH/HEIGHT, run()
+├── app.rs              90  App + ApplicationHandler (verbatim + small ctor)
+└── vulkan/
+    ├── mod.rs         126  VulkanApp{context, swapchain, pipeline, commands, sync} + new() + draw()
+    ├── device.rs      178  DeviceBundle (now stores queue_family_index)
+    ├── swapchain.rs   150  SwapchainBundle (now stores format)
+    ├── commands.rs     42  Commands{pool, buffer}
+    ├── sync.rs         52  SyncObjects (per-image render_finished comment kept)
+    ├── frame.rs        32  record_command_buffer (begin + dispatch + end)
+    ├── destroy.rs      21  pure orchestration, reverse creation order
+    └── pipeline/
+        ├── mod.rs      91  Pipeline (tuple variants) + new/record/destroy/wait_stage
+        ├── graphics.rs 247  Graphics::new/record/destroy
+        └── compute.rs  577  Compute::new/record/destroy + private find_memory_type/fill_randoms
+```
+
+Two things I finished beyond the mechanical move, per `docs/README.md`'s plan: constructors take `(context, swapchain)` — fixing `make_compute`'s 8-arg `(instance, physical_device, device, ...)` leak (also kills the clippy `too_many_arguments` warning) — and visibility is uniform `pub(crate)` with `Graphics`/`Compute` fields private to their files. All `match Pipeline` sites collapsed into `pipeline/mod.rs`. Teardown order and the load-bearing X11 `take()`→`destroy()`→`exit()` pattern are byte-identical.
+
+## Verification (per the plan's gate matrix)
+
+| Case                          | Result                                                                                   |
+| ----------------------------- | ---------------------------------------------------------------------------------------- |
+| `triangle.slang` (graphics)   | gradient triangle renders, validation layer silent, clean close, exit 0                  |
+| `2d_splatter.slang` (compute) | full-window splatter renders, validation silent, exit 0                                  |
+| splatter via stdin            | exit 0, validation silent                                                                |
+| 3 error fixtures              | all exit 1 with correct messages (incl. `error_not_supply` → the rewritten `run()` path) |
+
+`cargo check`/`build` clean; clippy shows only the 3 pre-existing `shader.rs` `collapsible_if` warnings. Skipped: missing-slangc case (untouched `shader.rs` path).
+
+Two notes:
+- `rustfmt` recursed from `lib.rs` and reformatted `src/shader.rs` (3 formatting-only hunks, no semantic change). I tried reverting it but the permission guard blocked discarding the changes — say the word and you can `git checkout -- src/shader.rs` yourself if you want the diff minimal.
+- Window discovery for the scripted close needed `_NET_WM_PID` tree search (mutter-x11-frames reparents client windows); saved to memory along with the harness location `/tmp/viewer_verify.py`.
+
+Working tree is uncommitted (`M src/lib.rs`, `?? src/app.rs`, `src/vulkan/`, plus the `shader.rs` formatting) — tell me if you want it committed.
+
+<hr />
+
 # Plan: full decomposition of `src/lib.rs` (1438 → ~45 lines)
 
 ## Target tree

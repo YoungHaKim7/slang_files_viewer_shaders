@@ -16,8 +16,7 @@
 
 use serde_json::Value;
 use std::{
-    env,
-    fs,
+    env, fs,
     io::{IsTerminal, Read},
     path::{Path, PathBuf},
     process::Command,
@@ -178,8 +177,12 @@ pub fn compile(workdir: &Path, source: &SourceFile) -> CompiledShader {
 
     fs::write(&scaffold_path, scaffold_source).expect("write combined shader source");
 
-    let scaffold =
-        invoke_slangc(&scaffold_path, &spirv_path, &reflection_path, Some(&scaffold_dir));
+    let scaffold = invoke_slangc(
+        &scaffold_path,
+        &spirv_path,
+        &reflection_path,
+        Some(&scaffold_dir),
+    );
 
     if let Ok(()) = &scaffold {
         if let Some(compiled) = finish(&spirv_path, &reflection_path) {
@@ -351,8 +354,8 @@ fn parse_parameters(reflection: &Value) -> Vec<ShaderParam> {
 
                     let access = param["type"]["access"].as_str().unwrap_or("");
 
-                    let is_float = param["type"]["resultType"]["scalarType"].as_str()
-                        == Some("float32");
+                    let is_float =
+                        param["type"]["resultType"]["scalarType"].as_str() == Some("float32");
 
                     let kind = match (base_shape, access) {
                         ("structuredBuffer", "readWrite") if is_float => {
