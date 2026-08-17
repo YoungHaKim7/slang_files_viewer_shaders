@@ -1,3 +1,45 @@
+# divided & conquer code
+
+- The decomposition design is ready. Here's the essence of it:
+
+# Plan: full decomposition of `src/lib.rs` (1438 → ~45 lines)
+
+## Target tree
+
+```
+src/
+├── lib.rs            ~45 lines: mod decls, WIDTH/HEIGHT, run()
+├── app.rs            ~75: App + ApplicationHandler (moved verbatim)
+└── vulkan/
+    ├── mod.rs        ~170: VulkanApp {context, swapchain, pipeline, commands, sync} + new() + draw()
+    ├── device.rs     ~200: DeviceBundle{entry, instance, surface_loader, surface, physical_device, device, queue, queue_family_index}
+    ├── swapchain.rs  ~140: SwapchainBundle{loader, swapchain, images, image_views, extent, format}
+    ├── commands.rs   ~45:  Commands{pool, buffer}
+    ├── sync.rs       ~55:  SyncObjects{image_available, render_finished, in_flight}
+    ├── frame.rs      ~35:  record_command_buffer (begin/end + dispatch)
+    ├── destroy.rs    ~60:  teardown as pure orchestration
+    └── pipeline/
+        ├── mod.rs    ~80:  Pipeline enum (tuple variants) + new/record/destroy/wait_stage dispatch
+        ├── graphics.rs ~215: Graphics::new/record/destroy
+        └── compute.rs  ~330: Compute::new/record/destroy + find_memory_type + fill_randoms (private)
+```
+
+## Key decisions
+
+- **All 4 `match Pipeline` sites collapse** into methods: `Pipeline::new` (build dispatch), `wait_stage()` (the COLOR_ATTACHMENT_OUTPUT vs TRANSFER choice in `draw`), `record()`, `destroy()`. The only remaining match is inside `pipeline/mod.rs`.
+- **`make_compute`'s parameter leak is fixed**: instead of `(instance, physical_device, device)`, constructors take `(&DeviceBundle, &SwapchainBundle)` — so `queue_family_index` and the surface `format` become stored fields.
+- **Uniform visibility**: bundles and `VulkanApp` are `pub(crate)`; `Graphics`/`Compute` fields fully private to their files (all their access stays local).
+- **No `Drop` impls** — teardown stays a manual, explicitly ordered call chain, each bundle owning its contiguous slice of today's sequence, with `destroy.rs` reviewable as one artifact against current `lib.rs:751-831`. The load-bearing X11 `take()` → `destroy()` → `exit()` pattern moves byte-identical.
+- ash 0.38's extension loaders are owned `Clone` structs (verified), so bundling them is borrow-safe; only the Vulkan-level destroy order matters, which the plan preserves exactly.
+
+## Sequencing — 10 steps, each ends build-green
+
+Extract in dependency order with runtime checks at the risky points: **app.rs → pipeline (verbatim move) → DeviceBundle → SwapchainBundle → sync → commands → variant conversion (the one semantic step; verified with validation layers on both render paths) → frame.rs → destroy.rs → final assembly.** Interactive runs (`assets/triangle.slang`, `assets/2d_splatter.slang`) + error fixtures gate steps 3, 4, 7, 9; the full matrix (graphics, compute, stdin, three error fixtures, missing slangc) gates the end.
+
+Full detail — exact line-range→file mapping, every method signature, and the teardown-order checklist — is in the plan. Want me to start executing it? I'd begin with the baseline check (`cargo build && cargo clippy`, record warnings) and Step 1.
+
+<hr />
+
 # fix
 
 - Done. Both problems are fixed and verified end-to-end.
@@ -26,3 +68,5 @@ cat assets/2d_splatter.slang | cargo run  # your original stdin form works too
 - Error paths: bad file → slangc diagnostics; missing file → exit 2; unsupported shaders (like `shader.slang`, which needs meshes) → clear message
 
 I saw your `a0822f0` commit — the small remaining diff on top of it is the validation-layer fixes + README. Window is non-resizable for now (no swapchain-recreation logic); live-reload and playground attributes like `TIME`/`MOUSE_POSITION` would be natural next steps.
+
+
