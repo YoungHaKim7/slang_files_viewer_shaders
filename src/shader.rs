@@ -151,13 +151,13 @@ pub fn compile(workdir: &Path, source: &SourceFile) -> CompiledShader {
     // First attempt: the file as-is.
     let plain = invoke_slangc(&source.path, &spirv_path, &reflection_path, None);
 
-    if let Ok(()) = &plain {
-        if let Some(compiled) = finish(&spirv_path, &reflection_path) {
-            return compiled;
-        }
-        // Compiles standalone but nothing displayable; the scaffold retry
-        // below may reveal playground entry points.
+    if let Ok(()) = &plain
+        && let Some(compiled) = finish(&spirv_path, &reflection_path)
+    {
+        return compiled;
     }
+    // Compiles standalone but nothing displayable; the scaffold retry
+    // below may reveal playground entry points.
 
     // Retry with the playground prelude available and imported.
     let scaffold_dir = workdir.join("prelude");
@@ -184,10 +184,10 @@ pub fn compile(workdir: &Path, source: &SourceFile) -> CompiledShader {
         Some(&scaffold_dir),
     );
 
-    if let Ok(()) = &scaffold {
-        if let Some(compiled) = finish(&spirv_path, &reflection_path) {
-            return compiled;
-        }
+    if let Ok(()) = &scaffold
+        && let Some(compiled) = finish(&spirv_path, &reflection_path)
+    {
+        return compiled;
     }
 
     // Nothing displayable, or no build succeeded. When the file failed to
@@ -307,16 +307,16 @@ fn finish(spirv_path: &Path, reflection_path: &Path) -> Option<CompiledShader> {
 
     // Graphics needs a vertex + fragment pair and must not declare any
     // resource parameters; the viewer supplies no vertex data or textures.
-    if let (Some(vertex_entry), Some(fragment_entry)) = (&vertex, &fragment) {
-        if parameters.is_empty() {
-            return Some(CompiledShader {
-                spirv: words,
-                mode: RenderMode::Graphics {
-                    vertex_entry: vertex_entry.clone(),
-                    fragment_entry: fragment_entry.clone(),
-                },
-            });
-        }
+    if let (Some(vertex_entry), Some(fragment_entry)) = (&vertex, &fragment)
+        && parameters.is_empty()
+    {
+        return Some(CompiledShader {
+            spirv: words,
+            mode: RenderMode::Graphics {
+                vertex_entry: vertex_entry.clone(),
+                fragment_entry: fragment_entry.clone(),
+            },
+        });
     }
 
     if let Some((entry, _, thread_group)) = compute {

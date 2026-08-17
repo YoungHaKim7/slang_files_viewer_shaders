@@ -83,6 +83,18 @@ Full detail — exact line-range→file mapping, every method signature, and the
 
 <hr />
 
+# `cargo clippy`
+
+- Fixed all three `collapsible_if` lints in `src/shader.rs` by collapsing into let-chains:
+
+- `src/shader.rs:154` — plain-compile path, with the "nothing displayable" comment moved outside the collapsed `if`
+- `src/shader.rs:187` — scaffold-retry path
+- `src/shader.rs:310` — graphics-mode selection (`parameters.is_empty()` joined with `&&`)
+
+`cargo fmt` + `cargo clippy --all-features --all-targets -- -D warnings` now pass clean, and `cargo test` builds without errors.
+
+<hr />
+
 # fix
 
 - Done. Both problems are fixed and verified end-to-end.
