@@ -1,10 +1,16 @@
+pub mod shader;
+
 use ash::{
     Entry,
     khr::{surface, swapchain},
     vk,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use std::{ffi::CString, mem::size_of};
+use shader::{CompiledShader, ParamKind, RenderMode};
+use std::{
+    ffi::CString,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -15,6 +21,38 @@ use winit::{
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
+
+/// Mode-specific Vulkan objects created around the compiled shader module.
+enum Pipeline {
+    /// Classic vertex + fragment rendering through a render pass.
+    Graphics {
+        render_pass: vk::RenderPass,
+        pipeline_layout: vk::PipelineLayout,
+        graphics_pipeline: vk::Pipeline,
+        framebuffers: Vec<vk::Framebuffer>,
+    },
+    /// Playground-style compute pass into an offscreen image that is
+    /// blitted to the swapchain.
+    Compute {
+        pipeline_layout: vk::PipelineLayout,
+        compute_pipeline: vk::Pipeline,
+
+        descriptor_pool: vk::DescriptorPool,
+        descriptor_set_layout: vk::DescriptorSetLayout,
+        descriptor_set: vk::DescriptorSet,
+
+        image: vk::Image,
+        image_memory: vk::DeviceMemory,
+        image_view: vk::ImageView,
+
+        /// The shader's random-float buffer, when it declares one.
+        rand_buffer: Option<(vk::Buffer, vk::DeviceMemory)>,
+
+        /// Work groups to dispatch; derived from threadGroupSize and the
+        /// image extent.
+        group_count: [u32; 3],
+    },
+}
 
 struct VulkanApp {
     // Held to keep the Vulkan loader alive for the instance lifetime.
@@ -39,11 +77,7 @@ struct VulkanApp {
     swapchain_image_views: Vec<vk::ImageView>,
     swapchain_extent: vk::Extent2D,
 
-    render_pass: vk::RenderPass,
-    pipeline_layout: vk::PipelineLayout,
-    graphics_pipeline: vk::Pipeline,
-
-    framebuffers: Vec<vk::Framebuffer>,
+    pipeline: Pipeline,
 
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
@@ -54,7 +88,7 @@ struct VulkanApp {
 }
 
 impl VulkanApp {
-    unsafe fn new(window: &Window) -> Self {
+    unsafe fn new(window: &Window, compiled: &CompiledShader) -> Self {
         unsafe {
             let entry = Entry::load().expect("failed to load Vulkan");
 
@@ -62,7 +96,7 @@ impl VulkanApp {
             // Instance
             //
 
-            let app_name = CString::new("Slang Triangle").unwrap();
+            let app_name = CString::new("Slang Viewer").unwrap();
 
             let app_info = vk::ApplicationInfo::default()
                 .application_name(&app_name)
@@ -282,11 +316,529 @@ impl VulkanApp {
                 .collect::<Vec<_>>();
 
             //
+            // Pipeline for the compiled shader
+            //
+
+            let module_info = vk::ShaderModuleCreateInfo::default().code(&compiled.spirv);
+
+            let shader_module = device
+                .create_shader_module(&module_info, None)
+                .expect("shader module");
+
+            let pipeline = match &compiled.mode {
+                RenderMode::Graphics {
+                    vertex_entry,
+                    fragment_entry,
+                } => Pipeline::make_graphics(
+                    &device,
+                    surface_format.format,
+                    &swapchain_image_views,
+                    extent,
+                    shader_module,
+                    vertex_entry,
+                    fragment_entry,
+                ),
+
+                RenderMode::Compute {
+                    entry,
+                    group_size,
+                    parameters,
+                } => Pipeline::make_compute(
+                    &instance,
+                    physical_device,
+                    &device,
+                    extent,
+                    shader_module,
+                    entry,
+                    group_size,
+                    parameters,
+                ),
+            };
+
+            // Pipelines capture the entry point names; the module is no
+            // longer needed.
+            device.destroy_shader_module(shader_module, None);
+
+            //
+            // Command pool
+            //
+
+            // RESET_COMMAND_BUFFER lets draw() reset and re-record the
+            // command buffer every frame for the acquired swapchain image.
+            let command_pool_info = vk::CommandPoolCreateInfo::default()
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+                .queue_family_index(queue_family_index);
+
+            let command_pool = device
+                .create_command_pool(&command_pool_info, None)
+                .expect("command pool");
+
+            let command_buffer_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+
+            let command_buffer = device
+                .allocate_command_buffers(&command_buffer_info)
+                .expect("command buffer")[0];
+
+            //
+            // Synchronization
+            //
+
+            let semaphore_info = vk::SemaphoreCreateInfo::default();
+
+            let image_available = device
+                .create_semaphore(&semaphore_info, None)
+                .expect("semaphore");
+
+            let render_finished = device
+                .create_semaphore(&semaphore_info, None)
+                .expect("semaphore");
+
+            let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+
+            let in_flight = device.create_fence(&fence_info, None).expect("fence");
+
+            Self {
+                entry,
+                instance,
+                surface_loader,
+                surface,
+                physical_device,
+                device,
+                queue,
+                swapchain_loader,
+                swapchain,
+                swapchain_images,
+                swapchain_image_views,
+                swapchain_extent: extent,
+                pipeline,
+                command_pool,
+                command_buffer,
+                image_available,
+                render_finished,
+                in_flight,
+            }
+        }
+    }
+
+    //
+    // Recorded fresh every frame for the swapchain image that was just
+    // acquired. The swapchain cycles through several images; recording
+    // once against a single framebuffer would present unrendered images
+    // and make the triangle blink.
+    //
+
+    unsafe fn record_command_buffer(&self, image_index: u32) {
+        unsafe {
+            self.device
+                .begin_command_buffer(self.command_buffer, &vk::CommandBufferBeginInfo::default())
+                .expect("begin command buffer");
+
+            match &self.pipeline {
+                Pipeline::Graphics {
+                    render_pass,
+                    graphics_pipeline,
+                    framebuffers,
+                    ..
+                } => {
+                    let clear_value = vk::ClearValue {
+                        color: vk::ClearColorValue {
+                            float32: [0.05, 0.05, 0.05, 1.0],
+                        },
+                    };
+
+                    let clear_values = [clear_value];
+
+                    let render_begin = vk::RenderPassBeginInfo::default()
+                        .render_pass(*render_pass)
+                        .framebuffer(framebuffers[image_index as usize])
+                        .render_area(vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: self.swapchain_extent,
+                        })
+                        .clear_values(&clear_values);
+
+                    self.device.cmd_begin_render_pass(
+                        self.command_buffer,
+                        &render_begin,
+                        vk::SubpassContents::INLINE,
+                    );
+
+                    self.device.cmd_bind_pipeline(
+                        self.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        *graphics_pipeline,
+                    );
+
+                    // No vertex buffer: SV_VertexID supplies the corner.
+                    self.device.cmd_draw(self.command_buffer, 3, 1, 0, 0);
+
+                    self.device.cmd_end_render_pass(self.command_buffer);
+                }
+
+                Pipeline::Compute {
+                    pipeline_layout,
+                    compute_pipeline,
+                    descriptor_set,
+                    image,
+                    group_count,
+                    ..
+                } => {
+                    let extent = self.swapchain_extent;
+
+                    let subresource = || {
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(0)
+                            .base_array_layer(0)
+                            .layer_count(1)
+                    };
+
+                    //
+                    // Offscreen image: undefined -> general (compute write)
+                    //
+
+                    let to_general = vk::ImageMemoryBarrier::default()
+                        .image(*image)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .level_count(1)
+                                .layer_count(1),
+                        )
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::GENERAL);
+
+                    self.device.cmd_pipeline_barrier(
+                        self.command_buffer,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_general],
+                    );
+
+                    //
+                    // Dispatch the kernel over the whole image
+                    //
+
+                    self.device.cmd_bind_pipeline(
+                        self.command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        *compute_pipeline,
+                    );
+
+                    self.device.cmd_bind_descriptor_sets(
+                        self.command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        *pipeline_layout,
+                        0,
+                        &[*descriptor_set],
+                        &[],
+                    );
+
+                    self.device.cmd_dispatch(
+                        self.command_buffer,
+                        group_count[0],
+                        group_count[1],
+                        group_count[2],
+                    );
+
+                    //
+                    // Offscreen: general -> transfer source
+                    //
+
+                    let to_transfer_src = vk::ImageMemoryBarrier::default()
+                        .image(*image)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .level_count(1)
+                                .layer_count(1),
+                        )
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                        .old_layout(vk::ImageLayout::GENERAL)
+                        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+
+                    //
+                    // Swapchain image: undefined -> transfer destination
+                    //
+
+                    let to_transfer_dst = vk::ImageMemoryBarrier::default()
+                        .image(self.swapchain_images[image_index as usize])
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .level_count(1)
+                                .layer_count(1),
+                        )
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+
+                    self.device.cmd_pipeline_barrier(
+                        self.command_buffer,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_transfer_src, to_transfer_dst],
+                    );
+
+                    //
+                    // Blit handles the format conversion between the
+                    // shader's rgba8 image and the swapchain format.
+                    //
+
+                    let blit = vk::ImageBlit2::default()
+                        .src_subresource(subresource())
+                        .src_offsets([
+                            vk::Offset3D { x: 0, y: 0, z: 0 },
+                            vk::Offset3D {
+                                x: extent.width as i32,
+                                y: extent.height as i32,
+                                z: 1,
+                            },
+                        ])
+                        .dst_subresource(subresource())
+                        .dst_offsets([
+                            vk::Offset3D { x: 0, y: 0, z: 0 },
+                            vk::Offset3D {
+                                x: extent.width as i32,
+                                y: extent.height as i32,
+                                z: 1,
+                            },
+                        ]);
+
+                    let blit_regions = [blit];
+
+                    let blit_info = vk::BlitImageInfo2::default()
+                        .src_image(*image)
+                        .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .dst_image(self.swapchain_images[image_index as usize])
+                        .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .regions(&blit_regions)
+                        .filter(vk::Filter::LINEAR);
+
+                    self.device.cmd_blit_image2(self.command_buffer, &blit_info);
+
+                    //
+                    // Swapchain image: transfer destination -> present
+                    //
+
+                    let to_present = vk::ImageMemoryBarrier::default()
+                        .image(self.swapchain_images[image_index as usize])
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .level_count(1)
+                                .layer_count(1),
+                        )
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::empty())
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+
+                    self.device.cmd_pipeline_barrier(
+                        self.command_buffer,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_present],
+                    );
+                }
+            }
+
+            self.device
+                .end_command_buffer(self.command_buffer)
+                .expect("end command buffer");
+        }
+    }
+
+    unsafe fn draw(&self) {
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.in_flight], true, u64::MAX)
+                .expect("wait fence");
+
+            self.device
+                .reset_fences(&[self.in_flight])
+                .expect("reset fence");
+
+            let (image_index, _) = self
+                .swapchain_loader
+                .acquire_next_image(
+                    self.swapchain,
+                    u64::MAX,
+                    self.image_available,
+                    vk::Fence::null(),
+                )
+                .expect("acquire image");
+
+            self.record_command_buffer(image_index);
+
+            let wait_semaphores = [self.image_available];
+
+            let signal_semaphores = [self.render_finished];
+
+            // Graphics waits before the render pass touches the color
+            // attachment; compute only needs the image by the blit.
+            let wait_stage = match &self.pipeline {
+                Pipeline::Graphics { .. } => vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                Pipeline::Compute { .. } => vk::PipelineStageFlags::TRANSFER,
+            };
+
+            let wait_stages = [wait_stage];
+
+            let command_buffers = [self.command_buffer];
+
+            let submit_info = vk::SubmitInfo::default()
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&command_buffers)
+                .signal_semaphores(&signal_semaphores);
+
+            self.device
+                .queue_submit(self.queue, &[submit_info], self.in_flight)
+                .expect("queue submit");
+
+            let swapchains = [self.swapchain];
+
+            let image_indices = [image_index];
+
+            let present_info = vk::PresentInfoKHR::default()
+                .wait_semaphores(&signal_semaphores)
+                .swapchains(&swapchains)
+                .image_indices(&image_indices);
+
+            self.swapchain_loader
+                .queue_present(self.queue, &present_info)
+                .expect("queue present");
+        }
+    }
+
+    unsafe fn destroy(&self) {
+        unsafe {
+            self.device.device_wait_idle().unwrap();
+
+            self.device.destroy_semaphore(self.image_available, None);
+
+            self.device.destroy_semaphore(self.render_finished, None);
+
+            self.device.destroy_fence(self.in_flight, None);
+
+            self.device.destroy_command_pool(self.command_pool, None);
+
+            match &self.pipeline {
+                Pipeline::Graphics {
+                    render_pass,
+                    pipeline_layout,
+                    graphics_pipeline,
+                    framebuffers,
+                } => {
+                    for &framebuffer in framebuffers {
+                        self.device.destroy_framebuffer(framebuffer, None);
+                    }
+
+                    self.device.destroy_pipeline(*graphics_pipeline, None);
+
+                    self.device.destroy_pipeline_layout(*pipeline_layout, None);
+
+                    self.device.destroy_render_pass(*render_pass, None);
+                }
+
+                Pipeline::Compute {
+                    pipeline_layout,
+                    compute_pipeline,
+                    descriptor_pool,
+                    descriptor_set_layout,
+                    image,
+                    image_memory,
+                    image_view,
+                    rand_buffer,
+                    ..
+                } => {
+                    self.device.destroy_pipeline(*compute_pipeline, None);
+
+                    self.device.destroy_pipeline_layout(*pipeline_layout, None);
+
+                    self.device
+                        .destroy_descriptor_pool(*descriptor_pool, None);
+
+                    self.device
+                        .destroy_descriptor_set_layout(*descriptor_set_layout, None);
+
+                    self.device.destroy_image_view(*image_view, None);
+
+                    self.device.destroy_image(*image, None);
+
+                    self.device.free_memory(*image_memory, None);
+
+                    if let Some((buffer, memory)) = rand_buffer {
+                        self.device.destroy_buffer(*buffer, None);
+
+                        self.device.free_memory(*memory, None);
+                    }
+                }
+            }
+
+            for &view in &self.swapchain_image_views {
+                self.device.destroy_image_view(view, None);
+            }
+
+            self.swapchain_loader
+                .destroy_swapchain(self.swapchain, None);
+
+            self.device.destroy_device(None);
+
+            self.surface_loader.destroy_surface(self.surface, None);
+
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
+impl Pipeline {
+    //
+    // Graphics pipeline: render pass + framebuffers + the vertex/fragment
+    // stages, matching the previous build-time triangle setup.
+    //
+
+    unsafe fn make_graphics(
+        device: &ash::Device,
+        surface_format: vk::Format,
+        swapchain_image_views: &[vk::ImageView],
+        extent: vk::Extent2D,
+        shader_module: vk::ShaderModule,
+        vertex_entry: &str,
+        fragment_entry: &str,
+    ) -> Self {
+        unsafe {
+
+            //
             // Render pass
             //
 
             let color_attachment = vk::AttachmentDescription::default()
-                .format(surface_format.format)
+                .format(surface_format)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .store_op(vk::AttachmentStoreOp::STORE)
@@ -315,63 +867,27 @@ impl VulkanApp {
                 .expect("render pass");
 
             //
-            // Load Slang-generated SPIR-V
-            //
-
-            let vertex_code = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.vert.spv"));
-
-            let fragment_code = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.frag.spv"));
-
-            let vertex_words = std::slice::from_raw_parts(
-                vertex_code.as_ptr() as *const u32,
-                vertex_code.len() / size_of::<u32>(),
-            );
-
-            let fragment_words = std::slice::from_raw_parts(
-                fragment_code.as_ptr() as *const u32,
-                fragment_code.len() / size_of::<u32>(),
-            );
-
-            let vertex_module_info = vk::ShaderModuleCreateInfo::default().code(vertex_words);
-
-            let fragment_module_info = vk::ShaderModuleCreateInfo::default().code(fragment_words);
-
-            let vertex_module = device
-                .create_shader_module(&vertex_module_info, None)
-                .expect("vertex shader module");
-
-            let fragment_module = device
-                .create_shader_module(&fragment_module_info, None)
-                .expect("fragment shader module");
-
-            //
             // Pipeline
             //
 
-            let main_name = CString::new("vertMain").unwrap();
+            let vertex_name = CString::new(vertex_entry).unwrap();
 
             let vertex_stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(vertex_module)
-                .name(&main_name);
+                .module(shader_module)
+                .name(&vertex_name);
 
-            let main_name_frag = CString::new("fragMain").unwrap();
+            let fragment_name = CString::new(fragment_entry).unwrap();
 
             let fragment_stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(fragment_module)
-                .name(&main_name_frag);
+                .module(shader_module)
+                .name(&fragment_name);
 
             let stages = [vertex_stage, fragment_stage];
 
-            //
-            // IMPORTANT:
-            //
-            // There are NO vertex attributes.
-            //
-            // SV_VertexID supplies the vertex number.
-            //
-
+            // There are NO vertex attributes: SV_VertexID supplies the
+            // vertex number.
             let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
 
             let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
@@ -442,10 +958,6 @@ impl VulkanApp {
                 .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
                 .expect("graphics pipeline")[0];
 
-            device.destroy_shader_module(vertex_module, None);
-
-            device.destroy_shader_module(fragment_module, None);
-
             //
             // Framebuffers
             //
@@ -466,241 +978,365 @@ impl VulkanApp {
                 })
                 .collect::<Vec<_>>();
 
-            //
-            // Command pool
-            //
-
-            // RESET_COMMAND_BUFFER lets draw() reset and re-record the
-            // command buffer every frame for the acquired swapchain image.
-            let command_pool_info = vk::CommandPoolCreateInfo::default()
-                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-                .queue_family_index(queue_family_index);
-
-            let command_pool = device
-                .create_command_pool(&command_pool_info, None)
-                .expect("command pool");
-
-            let command_buffer_info = vk::CommandBufferAllocateInfo::default()
-                .command_pool(command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-
-            let command_buffer = device
-                .allocate_command_buffers(&command_buffer_info)
-                .expect("command buffer")[0];
-
-            //
-            // Synchronization
-            //
-
-            let semaphore_info = vk::SemaphoreCreateInfo::default();
-
-            let image_available = device
-                .create_semaphore(&semaphore_info, None)
-                .expect("semaphore");
-
-            let render_finished = device
-                .create_semaphore(&semaphore_info, None)
-                .expect("semaphore");
-
-            let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-
-            let in_flight = device.create_fence(&fence_info, None).expect("fence");
-
-            Self {
-                entry,
-                instance,
-                surface_loader,
-                surface,
-                physical_device,
-                device,
-                queue,
-                swapchain_loader,
-                swapchain,
-                swapchain_images,
-                swapchain_image_views,
-                swapchain_extent: extent,
+            Pipeline::Graphics {
                 render_pass,
                 pipeline_layout,
                 graphics_pipeline,
                 framebuffers,
-                command_pool,
-                command_buffer,
-                image_available,
-                render_finished,
-                in_flight,
             }
         }
     }
 
     //
-    // Recorded fresh every frame for the swapchain image that was just
-    // acquired. The swapchain cycles through several images; recording
-    // once against a single framebuffer would present unrendered images
-    // and make the triangle blink.
+    // Compute pipeline: offscreen storage image + random buffer + the
+    // descriptor set the kernel's parameters bind to.
     //
 
-    unsafe fn record_command_buffer(&self, image_index: u32) {
+    unsafe fn make_compute(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        device: &ash::Device,
+        extent: vk::Extent2D,
+        shader_module: vk::ShaderModule,
+        entry: &str,
+        group_size: &[u32; 3],
+        parameters: &[shader::ShaderParam],
+    ) -> Self {
         unsafe {
-            self.device
-                .begin_command_buffer(self.command_buffer, &vk::CommandBufferBeginInfo::default())
-                .expect("begin command buffer");
 
-            let clear_value = vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: [0.05, 0.05, 0.05, 1.0],
-                },
-            };
+            //
+            // Offscreen image the kernel writes to. rgba8 matches the
+            // [format("rgba8")] on the playground's outputTexture; the
+            // blit to the swapchain handles any format difference.
+            //
 
-            let clear_values = [clear_value];
-
-            let render_begin = vk::RenderPassBeginInfo::default()
-                .render_pass(self.render_pass)
-                .framebuffer(self.framebuffers[image_index as usize])
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: self.swapchain_extent,
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .extent(vk::Extent3D {
+                    width: extent.width,
+                    height: extent.height,
+                    depth: 1,
                 })
-                .clear_values(&clear_values);
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
 
-            self.device.cmd_begin_render_pass(
-                self.command_buffer,
-                &render_begin,
-                vk::SubpassContents::INLINE,
-            );
+            let image = device.create_image(&image_info, None).expect("storage image");
 
-            self.device.cmd_bind_pipeline(
-                self.command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.graphics_pipeline,
-            );
+            let memory_requirements = device.get_image_memory_requirements(image);
 
-            //
-            // HERE!
-            //
-            // No vertex buffer.
-            //
-            // Draw 3 vertices.
-            //
-
-            self.device.cmd_draw(self.command_buffer, 3, 1, 0, 0);
-
-            self.device.cmd_end_render_pass(self.command_buffer);
-
-            self.device
-                .end_command_buffer(self.command_buffer)
-                .expect("end command buffer");
-        }
-    }
-
-    unsafe fn draw(&self) {
-        unsafe {
-            self.device
-                .wait_for_fences(&[self.in_flight], true, u64::MAX)
-                .expect("wait fence");
-
-            self.device
-                .reset_fences(&[self.in_flight])
-                .expect("reset fence");
-
-            let (image_index, _) = self
-                .swapchain_loader
-                .acquire_next_image(
-                    self.swapchain,
-                    u64::MAX,
-                    self.image_available,
-                    vk::Fence::null(),
+            let image_memory = device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(memory_requirements.size)
+                        .memory_type_index(find_memory_type(
+                            instance,
+                            physical_device,
+                            memory_requirements.memory_type_bits,
+                            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                        )),
+                    None,
                 )
-                .expect("acquire image");
+                .expect("allocate image memory");
 
-            self.record_command_buffer(image_index);
+            device.bind_image_memory(image, image_memory, 0).expect("bind image memory");
 
-            let wait_semaphores = [self.image_available];
+            let image_view = device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(vk::Format::R8G8B8A8_UNORM)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .level_count(1)
+                                .layer_count(1),
+                        ),
+                    None,
+                )
+                .expect("storage image view");
 
-            let signal_semaphores = [self.render_finished];
+            //
+            // Random-float buffer, when the kernel declares one. Uploaded
+            // through host-visible memory; a viewer does not need a
+            // staging pass.
+            //
 
-            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let rand_param = parameters
+                .iter()
+                .find(|param| matches!(param.kind, ParamKind::RandomFloatBuffer));
 
-            let command_buffers = [self.command_buffer];
+            let rand_buffer = rand_param.map(|param| {
+                let count = param
+                    .rand_count
+                    .unwrap_or(shader::DEFAULT_RAND_COUNT) as usize;
 
-            let submit_info = vk::SubmitInfo::default()
-                .wait_semaphores(&wait_semaphores)
-                .wait_dst_stage_mask(&wait_stages)
-                .command_buffers(&command_buffers)
-                .signal_semaphores(&signal_semaphores);
+                let buffer_info = vk::BufferCreateInfo::default()
+                    .size((count * std::mem::size_of::<f32>()) as vk::DeviceSize)
+                    .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-            self.device
-                .queue_submit(self.queue, &[submit_info], self.in_flight)
-                .expect("queue submit");
+                let buffer = device
+                    .create_buffer(&buffer_info, None)
+                    .expect("random buffer");
 
-            let swapchains = [self.swapchain];
+                let memory_requirements = device.get_buffer_memory_requirements(buffer);
 
-            let image_indices = [image_index];
+                let memory = device
+                    .allocate_memory(
+                        &vk::MemoryAllocateInfo::default()
+                            .allocation_size(memory_requirements.size)
+                            .memory_type_index(find_memory_type(
+                                instance,
+                                physical_device,
+                                memory_requirements.memory_type_bits,
+                                vk::MemoryPropertyFlags::HOST_VISIBLE
+                                    | vk::MemoryPropertyFlags::HOST_COHERENT,
+                            )),
+                        None,
+                    )
+                    .expect("allocate random buffer memory");
 
-            let present_info = vk::PresentInfoKHR::default()
-                .wait_semaphores(&signal_semaphores)
-                .swapchains(&swapchains)
-                .image_indices(&image_indices);
+                device
+                    .bind_buffer_memory(buffer, memory, 0)
+                    .expect("bind random buffer memory");
 
-            self.swapchain_loader
-                .queue_present(self.queue, &present_info)
-                .expect("queue present");
+                let randoms = fill_randoms(count);
+
+                let mapped = device
+                    .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                    .expect("map random buffer") as *mut f32;
+
+                for (index, value) in randoms.iter().enumerate() {
+                    mapped.add(index).write(*value);
+                }
+
+                device.unmap_memory(memory);
+
+                (buffer, memory)
+            });
+
+            //
+            // Descriptors: one binding per reflection parameter, at the
+            // binding index slangc assigned.
+            //
+
+            let bindings = parameters
+                .iter()
+                .map(|param| {
+                    let descriptor_type = match param.kind {
+                        ParamKind::RandomFloatBuffer => {
+                            vk::DescriptorType::STORAGE_BUFFER
+                        }
+                        ParamKind::OutputTexture => vk::DescriptorType::STORAGE_IMAGE,
+                        ParamKind::Unsupported(_) => unreachable!("validated before init"),
+                    };
+
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(param.binding)
+                        .descriptor_type(descriptor_type)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                })
+                .collect::<Vec<_>>();
+
+            let descriptor_set_layout = device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                    None,
+                )
+                .expect("descriptor set layout");
+
+            let pool_sizes = [
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(bindings.len() as u32),
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::STORAGE_IMAGE)
+                    .descriptor_count(bindings.len() as u32),
+            ];
+
+            let descriptor_pool = device
+                .create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(1)
+                        .pool_sizes(&pool_sizes),
+                    None,
+                )
+                .expect("descriptor pool");
+
+            let descriptor_set = device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(descriptor_pool)
+                        .set_layouts(&[descriptor_set_layout]),
+                )
+                .expect("descriptor set")[0];
+
+            let buffer_info = vk::DescriptorBufferInfo::default()
+                .buffer(rand_buffer.map(|(buffer, _)| buffer).unwrap_or(vk::Buffer::null()))
+                .offset(0)
+                .range(vk::WHOLE_SIZE);
+
+            let image_info = vk::DescriptorImageInfo::default()
+                .image_view(image_view)
+                .image_layout(vk::ImageLayout::GENERAL);
+
+            let writes = parameters
+                .iter()
+                .map(|param| {
+                    let write = vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(param.binding)
+                        .descriptor_type(match param.kind {
+                            ParamKind::RandomFloatBuffer => vk::DescriptorType::STORAGE_BUFFER,
+                            ParamKind::OutputTexture => vk::DescriptorType::STORAGE_IMAGE,
+                            ParamKind::Unsupported(_) => unreachable!("validated before init"),
+                        });
+
+                    match param.kind {
+                        ParamKind::RandomFloatBuffer => {
+                            write.buffer_info(std::slice::from_ref(&buffer_info))
+                        }
+                        ParamKind::OutputTexture => {
+                            write.image_info(std::slice::from_ref(&image_info))
+                        }
+                        ParamKind::Unsupported(_) => unreachable!("validated before init"),
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            device.update_descriptor_sets(&writes, &[]);
+
+            //
+            // Compute pipeline
+            //
+
+            let pipeline_layout = device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .set_layouts(&[descriptor_set_layout]),
+                    None,
+                )
+                .expect("compute pipeline layout");
+
+            let entry_name = CString::new(entry).unwrap();
+
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(shader_module)
+                .name(&entry_name);
+
+            let compute_pipeline = device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default()
+                        .stage(stage)
+                        .layout(pipeline_layout)],
+                    None,
+                )
+                .expect("compute pipeline")[0];
+
+            //
+            // Cover the whole image with the kernel's thread group size.
+            //
+
+            let group_count = [
+                extent.width.div_ceil(group_size[0].max(1)),
+                extent.height.div_ceil(group_size[1].max(1)),
+                1,
+            ];
+
+            Pipeline::Compute {
+                pipeline_layout,
+                compute_pipeline,
+                descriptor_pool,
+                descriptor_set_layout,
+                descriptor_set,
+                image,
+                image_memory,
+                image_view,
+                rand_buffer,
+                group_count,
+            }
         }
     }
+}
 
-    unsafe fn destroy(&self) {
-        unsafe {
-            self.device.device_wait_idle().unwrap();
+unsafe fn find_memory_type(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    type_filter: u32,
+    properties: vk::MemoryPropertyFlags,
+) -> u32 {
+    let memory_properties = unsafe {
+        instance.get_physical_device_memory_properties(physical_device)
+    };
 
-            self.device.destroy_semaphore(self.image_available, None);
+    (0..memory_properties.memory_type_count)
+        .find(|&index| {
+            let memory_type = memory_properties.memory_types[index as usize];
 
-            self.device.destroy_semaphore(self.render_finished, None);
+            type_filter & (1 << index) != 0
+                && memory_type.property_flags.contains(properties)
+        })
+        .expect("no memory type with the requested properties")
+}
 
-            self.device.destroy_fence(self.in_flight, None);
+/// Uniform randoms in [0, 1) from a xorshift64* generator. The playground
+/// fills its RAND buffers the same way (host-side, once at startup).
+fn fill_randoms(count: usize) -> Vec<f32> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
 
-            self.device.destroy_command_pool(self.command_pool, None);
+    let mut state = nanos | 1;
 
-            for &framebuffer in &self.framebuffers {
-                self.device.destroy_framebuffer(framebuffer, None);
-            }
+    (0..count)
+        .map(|_| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
 
-            self.device.destroy_pipeline(self.graphics_pipeline, None);
+            let mixed = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
 
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-
-            self.device.destroy_render_pass(self.render_pass, None);
-
-            for &view in &self.swapchain_image_views {
-                self.device.destroy_image_view(view, None);
-            }
-
-            self.swapchain_loader
-                .destroy_swapchain(self.swapchain, None);
-
-            self.device.destroy_device(None);
-
-            self.surface_loader.destroy_surface(self.surface, None);
-
-            self.instance.destroy_instance(None);
-        }
-    }
+            (mixed >> 40) as f32 / (1u64 << 24) as f32
+        })
+        .collect()
 }
 
 struct App {
     window: Option<Window>,
     vulkan: Option<VulkanApp>,
+
+    /// File name shown in the window title.
+    shader_name: String,
+    compiled: Option<CompiledShader>,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attributes = WindowAttributes::default()
-            .with_title("Rust + Slang + Vulkan")
-            .with_inner_size(LogicalSize::new(WIDTH, HEIGHT));
+            .with_title(format!("Slang Viewer — {}", self.shader_name))
+            .with_inner_size(LogicalSize::new(WIDTH, HEIGHT))
+            // The viewer does not recreate the swapchain on resize yet.
+            .with_resizable(false);
 
         let window = event_loop.create_window(attributes).expect("window");
 
-        let vulkan = unsafe { VulkanApp::new(&window) };
+        let compiled = self
+            .compiled
+            .as_ref()
+            .expect("shader must be compiled before the window opens");
+
+        let vulkan = unsafe { VulkanApp::new(&window, compiled) };
 
         self.window = Some(window);
         self.vulkan = Some(vulkan);
@@ -714,7 +1350,10 @@ impl ApplicationHandler for App {
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                if let Some(vulkan) = &self.vulkan {
+                // take() clears the field: winit still delivers a pending
+                // RedrawRequested after this handler on X11, and it must
+                // not touch the destroyed Vulkan objects.
+                if let Some(vulkan) = self.vulkan.take() {
                     unsafe {
                         vulkan.destroy();
                     }
@@ -744,12 +1383,41 @@ impl ApplicationHandler for App {
 
 /// Creates the event loop and runs the application until the window closes.
 pub fn run() {
+    let workdir = shader::create_workdir();
+
+    let source = shader::resolve_source(&workdir);
+
+    let compiled = shader::compile(&workdir, &source);
+
+    // The viewer can only supply random buffers and the output texture;
+    // reject anything else before any window or device exists.
+    if let RenderMode::Compute { parameters, .. } = &compiled.mode {
+        for param in parameters {
+            if let ParamKind::Unsupported(what) = &param.kind {
+                eprintln!(
+                    "error: parameter '{}' is {what}; the viewer can only supply \
+                     random float buffers and the output texture",
+                    param.name
+                );
+
+                std::process::exit(1);
+            }
+        }
+    }
+
     let event_loop = EventLoop::new().expect("event loop");
 
     let mut app = App {
         window: None,
         vulkan: None,
+        shader_name: source.display_name.clone(),
+        compiled: Some(compiled),
     };
 
-    event_loop.run_app(&mut app).expect("event loop error");
+    let result = event_loop.run_app(&mut app);
+
+    // Scratch files are no longer needed once the app is done.
+    let _ = std::fs::remove_dir_all(workdir);
+
+    result.expect("event loop error");
 }
