@@ -1,5 +1,6 @@
+use crate::app::{HEIGHT, WIDTH};
+
 use super::device::DeviceBundle;
-use crate::{HEIGHT, WIDTH};
 use ash::{khr::swapchain, vk};
 
 pub(crate) struct SwapchainBundle {
