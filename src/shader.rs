@@ -119,6 +119,12 @@ pub fn resolve_source(workdir: &Path) -> SourceFile {
             .read_to_string(&mut source)
             .expect("read shader from stdin");
 
+        if source.trim().is_empty() {
+            eprintln!("error: no shader source received on stdin");
+
+            std::process::exit(2);
+        }
+
         let path = workdir.join("stdin.slang");
 
         fs::write(&path, source).expect("write stdin shader to temp file");
@@ -210,6 +216,9 @@ fn invoke_slangc(
         .arg(source)
         .arg("-target")
         .arg("spirv")
+        // SPIR-V 1.3 is the newest version Vulkan 1.1 accepts.
+        .arg("-profile")
+        .arg("spirv_1_3")
         // Keep entry point names (vertMain/fragMain/imageMain) instead of
         // renaming every entry to "main".
         .arg("-fvk-use-entrypoint-name")

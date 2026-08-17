@@ -83,7 +83,10 @@ struct VulkanApp {
     command_buffer: vk::CommandBuffer,
 
     image_available: vk::Semaphore,
-    render_finished: vk::Semaphore,
+    // One per swapchain image: a present operation's semaphore wait is not
+    // covered by the in-flight fence, so a single semaphore could be
+    // signaled again while a previous present still uses it.
+    render_finished: Vec<vk::Semaphore>,
     in_flight: vk::Fence,
 }
 
@@ -271,7 +274,11 @@ impl VulkanApp {
                 .image_color_space(surface_format.color_space)
                 .image_extent(extent)
                 .image_array_layers(1)
-                .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                // TRANSFER_DST: the compute path blits into the swapchain
+                // images; COLOR_ATTACHMENT covers the graphics path.
+                .image_usage(
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST,
+                )
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .pre_transform(capabilities.current_transform)
                 .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -392,9 +399,13 @@ impl VulkanApp {
                 .create_semaphore(&semaphore_info, None)
                 .expect("semaphore");
 
-            let render_finished = device
-                .create_semaphore(&semaphore_info, None)
-                .expect("semaphore");
+            let render_finished = (0..swapchain_images.len())
+                .map(|_| {
+                    device
+                        .create_semaphore(&semaphore_info, None)
+                        .expect("semaphore")
+                })
+                .collect::<Vec<_>>();
 
             let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
 
@@ -601,10 +612,12 @@ impl VulkanApp {
 
                     //
                     // Blit handles the format conversion between the
-                    // shader's rgba8 image and the swapchain format.
+                    // shader's rgba8 image and the swapchain format. The
+                    // core 1.0 vkCmdBlitImage is used (the *2 variant needs
+                    // Vulkan 1.3 or KHR_copy_commands2).
                     //
 
-                    let blit = vk::ImageBlit2::default()
+                    let blit = vk::ImageBlit::default()
                         .src_subresource(subresource())
                         .src_offsets([
                             vk::Offset3D { x: 0, y: 0, z: 0 },
@@ -626,15 +639,15 @@ impl VulkanApp {
 
                     let blit_regions = [blit];
 
-                    let blit_info = vk::BlitImageInfo2::default()
-                        .src_image(*image)
-                        .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                        .dst_image(self.swapchain_images[image_index as usize])
-                        .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                        .regions(&blit_regions)
-                        .filter(vk::Filter::LINEAR);
-
-                    self.device.cmd_blit_image2(self.command_buffer, &blit_info);
+                    self.device.cmd_blit_image(
+                        self.command_buffer,
+                        *image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        self.swapchain_images[image_index as usize],
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &blit_regions,
+                        vk::Filter::LINEAR,
+                    );
 
                     //
                     // Swapchain image: transfer destination -> present
@@ -697,7 +710,7 @@ impl VulkanApp {
 
             let wait_semaphores = [self.image_available];
 
-            let signal_semaphores = [self.render_finished];
+            let signal_semaphores = [self.render_finished[image_index as usize]];
 
             // Graphics waits before the render pass touches the color
             // attachment; compute only needs the image by the blit.
@@ -741,7 +754,9 @@ impl VulkanApp {
 
             self.device.destroy_semaphore(self.image_available, None);
 
-            self.device.destroy_semaphore(self.render_finished, None);
+            for &semaphore in &self.render_finished {
+                self.device.destroy_semaphore(semaphore, None);
+            }
 
             self.device.destroy_fence(self.in_flight, None);
 
