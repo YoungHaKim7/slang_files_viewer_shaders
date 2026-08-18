@@ -14,6 +14,28 @@ cat assets/2d_splatter.slang | cargo run  # same, source via stdin
 - Download SDK
   - https://vulkan.lunarg.com/sdk/home
 
+### PATH
+- https://github.com/marketplace/actions/install-vulkan-sdk-and-runtime#environment-variables
+- https://stackoverflow.com/questions/37756556/how-should-i-set-the-vulkan-sdk-environment-variables
+
+- `~/.bashrc` 예시
+```bash
+$ tail -4 ~/.bashrc
+VULKAN_SDK=~/vulkan/VulkanSDK/1.0.13.0/x86_64
+export PATH=$PATH:$VULKAN_SDK/bin
+export LD_LIBRARY_PATH=$VULKAN_SDK/lib
+```
+
+- `.config/fish/config.fish` 예시
+
+```bash
+fish_add_path "$HOME/vulkan/vulkansdk-linux-x86_64-1.4.357.1/1.4.357.1/x86_64/bin"
+
+# Vulkan SDK PATH
+set -gx VULKAN_SDK $HOME/vulkan/vulkansdk-linux-x86_64-1.4.357.1/1.4.357.1/x86_64
+set -gx LD_LIBRARY_PATH "$VULKAN_SDK/lib:" $LD_LIBRARY_PATH
+```
+
 - Bin Directory: Append `%VULKAN_SDK%\Bin` to your user or system `PATH` for `glslc` and other CLI tools.
 
 - Lib and Include Paths: Reference `$(VULKAN_SDK)\Lib` and `$(VULKAN_SDK)\Include` inside your IDE (like Visual Studio) for building projects.
