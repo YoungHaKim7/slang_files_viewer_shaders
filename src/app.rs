@@ -1,6 +1,9 @@
-use crate::app;
-use crate::shader::{self, CompiledShader};
-use crate::vulkan::VulkanApp;
+use crate::{
+    app,
+    shader::{self, CompiledShader},
+    vulkan::VulkanApp,
+};
+
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,

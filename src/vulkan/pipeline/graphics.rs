@@ -1,6 +1,7 @@
-use crate::vulkan::device::DeviceBundle;
-use crate::vulkan::swapchain::SwapchainBundle;
+use crate::vulkan::{device::DeviceBundle, swapchain::SwapchainBundle};
+
 use ash::{Device, vk};
+
 use std::ffi::CString;
 
 /// Classic vertex + fragment rendering through a render pass.

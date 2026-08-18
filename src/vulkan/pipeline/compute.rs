@@ -1,6 +1,7 @@
-use crate::shader::{DEFAULT_RAND_COUNT, ParamKind, ShaderParam};
-use crate::vulkan::device::DeviceBundle;
-use crate::vulkan::swapchain::SwapchainBundle;
+use crate::{
+    shader::{DEFAULT_RAND_COUNT, ParamKind, ShaderParam},
+    vulkan::{device::DeviceBundle, swapchain::SwapchainBundle},
+};
 use ash::{Device, Instance, vk};
 use std::{
     ffi::CString,

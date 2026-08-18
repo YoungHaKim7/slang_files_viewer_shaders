@@ -9,6 +9,15 @@ cargo run -- assets/2d_splatter.slang     # playground-style compute shader
 cat assets/2d_splatter.slang | cargo run  # same, source via stdin
 ```
 
+## Dependencies
+
+- Download SDK
+  - https://vulkan.lunarg.com/sdk/home
+
+- Bin Directory: Append `%VULKAN_SDK%\Bin` to your user or system `PATH` for `glslc` and other CLI tools.
+
+- Lib and Include Paths: Reference `$(VULKAN_SDK)\Lib` and `$(VULKAN_SDK)\Include` inside your IDE (like Visual Studio) for building projects.
+
 ## What it can display
 
 - **Vertex + fragment** entry points with no resource parameters
