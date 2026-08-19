@@ -504,7 +504,7 @@
 //! with the newly acquired image.
 //!
 //! ## 12. Vulkan ownership and Rust ownership
-//!
+//! - [Ownership Concepts(C++ VS Rust), If you want to learn more, come to my blog.](https://younghakim7.github.io/blog/posts/unique_ptr_vs_shared_ptr_ownership/)
 //! Vulkan itself uses explicit handle lifetime management.
 //!
 //! For example:
