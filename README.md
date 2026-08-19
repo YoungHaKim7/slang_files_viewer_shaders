@@ -1,4 +1,28 @@
-# Slang shader viewer
+<h1 align="center">Slang shader viewer</h1>
+<br />
+
+<div align="center">
+  <!-- Crates version -->
+  <a href="https://crates.io/crates/slang_files_viewer_shaders">
+    <img src="https://img.shields.io/crates/v/slang_files_viewer_shaders.svg?style=flat-square"
+    alt="Crates.io version" />
+  </a>
+  <!-- Downloads -->
+  <a href="https://crates.io/crates/slang_files_viewer_shaders">
+    <img src="https://img.shields.io/crates/d/slang_files_viewer_shaders.svg?style=flat-square"
+      alt="Download" />
+  </a>
+  <!-- docs.rs docs -->
+  <a href="https://docs.rs/slang_files_viewer_shaders">
+    <img src="https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square"
+      alt="docs.rs docs" />
+  </a>
+</div>
+
+<br />
+
+
+# Run
 
 Opens a `.slang` file in a window and renders it with Vulkan. `slangc` from
 the Vulkan SDK must be on `PATH`.
