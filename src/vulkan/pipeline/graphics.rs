@@ -259,6 +259,9 @@ impl Graphics {
                 self.graphics_pipeline,
             );
 
+            //
+            // HERE!
+            //
             // No vertex buffer: SV_VertexID supplies the corner.
             device.cmd_draw(command_buffer, 3, 1, 0, 0);
 
