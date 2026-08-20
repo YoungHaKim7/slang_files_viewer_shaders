@@ -9,6 +9,15 @@ impl VulkanApp {
     // and make the triangle blink.
     //
 
+    /// Records commands for the swapchain image selected by `image_index`.
+    ///
+    /// A command buffer is not a drawing operation by itself. It is a list of
+    /// commands that will later be executed by a Vulkan queue. Here the list
+    /// is deliberately small:
+    ///
+    /// `begin -> begin render pass -> bind pipeline -> draw 3 vertices -> end`
+    ///
+    /// The framebuffer is selected from the acquired swapchain image index.
     pub(crate) unsafe fn record_command_buffer(&self, image_index: u32) {
         unsafe {
             self.context

@@ -19,7 +19,13 @@ impl SwapchainBundle {
     pub(crate) unsafe fn new(context: &DeviceBundle) -> Self {
         unsafe {
             //
+            // ------------------------------------------------------------
             // Surface capabilities
+            // ------------------------------------------------------------
+            //
+            // The window system constrains swapchain image count, extent,
+            // format, and presentation mode. These queries let us choose a
+            // configuration the selected GPU and window surface support.
             //
 
             let capabilities = context
@@ -67,7 +73,13 @@ impl SwapchainBundle {
             };
 
             //
+            // ------------------------------------------------------------
             // Swapchain
+            // ------------------------------------------------------------
+            //
+            // A swapchain is a collection of images used for presentation.
+            // The application renders into one acquired image while other
+            // images may be displayed or waiting to be presented.
             //
 
             let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()
@@ -99,7 +111,13 @@ impl SwapchainBundle {
                 .expect("failed to get swapchain images");
 
             //
-            // Image views
+            // ------------------------------------------------------------
+            // Swapchain Image Views
+            // ------------------------------------------------------------
+            //
+            // A VkImage is the underlying image resource. An image view tells
+            // Vulkan how a shader/render pass should interpret a portion of
+            // that image. Render-pass framebuffers use these views.
             //
 
             let image_views = images
@@ -139,6 +157,17 @@ impl SwapchainBundle {
         }
     }
 
+    /// Releases Vulkan resources in dependency-safe reverse order.
+    ///
+    /// Vulkan does not automatically destroy handles merely because a Rust
+    /// variable goes out of scope. Every created Vulkan object must be
+    /// explicitly destroyed (or wrapped in an RAII abstraction that performs
+    /// the same operation).
+    ///
+    /// Destruction must respect dependencies. For example, framebuffers use
+    /// image views and a render pass, so they are destroyed before those
+    /// objects. The device is destroyed only after device-owned resources are
+    /// gone, and the instance is destroyed last.
     pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
         unsafe {
             for &view in &self.image_views {

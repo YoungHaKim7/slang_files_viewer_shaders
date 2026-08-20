@@ -56,6 +56,11 @@ pub fn run() {
     result.expect("event loop error");
 }
 
+/// Small winit application state.
+///
+/// `window` must remain alive while the Vulkan surface is being used. The
+/// `VulkanApp` is therefore kept alongside the window rather than creating
+/// and immediately dropping the window after initialization.
 pub(crate) struct App {
     window: Option<Window>,
     vulkan: Option<VulkanApp>,

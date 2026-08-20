@@ -58,7 +58,14 @@ impl DeviceBundle {
                 .expect("failed to create Vulkan instance");
 
             //
-            // Surface
+            // ------------------------------------------------------------
+            // Window  Surface
+            // ------------------------------------------------------------
+            //
+            // A VkSurfaceKHR represents a platform window as a Vulkan
+            // presentation target. The surface is owned by the instance and
+            // is used later when checking presentation support and creating
+            // the swapchain.
             //
 
             let surface = ash_window::create_surface(
@@ -72,10 +79,13 @@ impl DeviceBundle {
 
             let surface_loader = surface::Instance::new(&entry, &instance);
 
+            // ------------------------------------------------------------
+            // Physical Device (GPU)
+            // ------------------------------------------------------------
             //
-            // Physical device
-            //
-
+            // A physical device describes an actual Vulkan-capable GPU.
+            // Nothing is submitted to it directly; first we create a logical
+            // device that exposes the queues and features we need.
             let physical_devices = instance
                 .enumerate_physical_devices()
                 .expect("failed to enumerate physical devices");
@@ -102,7 +112,14 @@ impl DeviceBundle {
                 .expect("no suitable Vulkan device");
 
             //
-            // Logical device
+            // ------------------------------------------------------------
+            // Logical Device and Queue
+            // ------------------------------------------------------------
+            //
+            //
+            // The logical device is this application's interface to the
+            // selected GPU. A queue is the execution endpoint to which we
+            // submit command buffers.
             //
 
             // slangc declares an (unused) BuiltIn BaseVertex input for
@@ -166,6 +183,17 @@ impl DeviceBundle {
         }
     }
 
+    /// Releases Vulkan resources in dependency-safe reverse order.
+    ///
+    /// Vulkan does not automatically destroy handles merely because a Rust
+    /// variable goes out of scope. Every created Vulkan object must be
+    /// explicitly destroyed (or wrapped in an RAII abstraction that performs
+    /// the same operation).
+    ///
+    /// Destruction must respect dependencies. For example, framebuffers use
+    /// image views and a render pass, so they are destroyed before those
+    /// objects. The device is destroyed only after device-owned resources are
+    /// gone, and the instance is destroyed last.
     pub(crate) unsafe fn destroy(&self) {
         unsafe {
             self.device.destroy_device(None);

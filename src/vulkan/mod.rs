@@ -16,6 +16,26 @@ use winit::window::Window;
 
 use crate::shader::CompiledShader;
 
+/// Owns the Vulkan objects required to render one triangle.
+///
+/// # Vulkan object hierarchy
+///
+/// The important lifetime relationships are roughly:
+///
+/// `Entry -> Instance -> PhysicalDevice -> Device -> Queue`
+///
+/// and, for presentation:
+///
+/// `Instance -> Surface -> Swapchain -> Images -> ImageViews -> Framebuffers`
+///
+/// The graphics pipeline depends on the render pass, while command buffers
+/// refer to the pipeline and the framebuffer selected for the acquired
+/// swapchain image.
+///
+/// Vulkan handles are generally lightweight, non-owning values. The Rust
+/// struct therefore acts as the owner of the corresponding Vulkan resources,
+/// and `destroy()` releases them in dependency-safe reverse order.
+///
 /// Everything the viewer needs to present frames: one bundle per concern,
 /// torn down in reverse creation order by destroy().
 pub(crate) struct VulkanApp {
@@ -27,6 +47,27 @@ pub(crate) struct VulkanApp {
 }
 
 impl VulkanApp {
+    /// Creates all Vulkan state needed by the triangle renderer.
+    ///
+    /// Vulkan exposes a relatively explicit initialization model. In broad
+    /// terms this function performs these steps:
+    ///
+    /// 1. Load the Vulkan loader (`Entry`).
+    /// 2. Create a Vulkan `Instance`.
+    /// 3. Create a window `Surface` that Vulkan can present to.
+    /// 4. Select a physical GPU and a queue family supporting graphics and presentation.
+    /// 5. Create a logical `Device` and obtain a graphics queue.
+    /// 6. Query surface capabilities and create a `Swapchain`.
+    /// 7. Create image views for the swapchain images.
+    /// 8. Create a render pass describing the color attachment.
+    /// 9. Load Slang-generated SPIR-V and create shader modules.
+    /// 10. Build the graphics pipeline.
+    /// 11. Create framebuffers, command infrastructure, and synchronization.
+    ///
+    /// Most Vulkan functions are `unsafe` here because Vulkan's C API cannot
+    /// express resource validity, synchronization, or lifetime dependencies
+    /// in its type system. The surrounding Rust code establishes those
+    /// invariants manually.
     pub(crate) unsafe fn new(window: &Window, compiled: &CompiledShader) -> Self {
         unsafe {
             let context = DeviceBundle::new(window);
@@ -64,6 +105,18 @@ impl VulkanApp {
         }
     }
 
+    /// Executes one complete frame.
+    ///
+    /// The CPU/GPU sequence is:
+    ///
+    /// 1. Wait until the previous use of our reusable command buffer is done.
+    /// 2. Acquire a swapchain image.
+    /// 3. Record commands targeting that image's framebuffer.
+    /// 4. Submit those commands to the graphics queue.
+    /// 5. Present the same swapchain image after rendering finishes.
+    ///
+    /// The semaphores establish GPU-to-GPU ordering; the fence establishes
+    /// CPU-to-GPU reuse ordering.
     pub(crate) unsafe fn draw(&self) {
         unsafe {
             self.context
@@ -93,6 +146,10 @@ impl VulkanApp {
 
             let signal_semaphores = [self.sync.render_finished[image_index as usize]];
 
+            // The semaphore wait is consumed before the color-attachment
+            // output stage. In other words, the GPU must not start writing
+            // the acquired swapchain image until image acquisition signals
+            // `image_available`.
             let wait_stages = [self.pipeline.wait_stage()];
 
             let command_buffers = [self.commands.buffer];

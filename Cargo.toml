@@ -1,6 +1,6 @@
 [package]
 name = "slang_files_viewer_shaders"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.97"
 description = "A viewer that uses Vulkan as the backend to convert a slang file into an SPV file, and visualizes it using two files: a frag and a vert file."

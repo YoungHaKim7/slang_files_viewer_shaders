@@ -35,7 +35,13 @@ impl Graphics {
             let extent = swapchain.extent;
 
             //
-            // Render pass
+            // ------------------------------------------------------------
+            // Render Pass
+            // ------------------------------------------------------------
+            //
+            // This render pass has one color attachment. It is cleared at
+            // the beginning of the render pass, used as a color attachment,
+            // and transitioned to PRESENT_SRC_KHR when rendering finishes.
             //
 
             let color_attachment = vk::AttachmentDescription::default()
@@ -68,7 +74,25 @@ impl Graphics {
                 .expect("render pass");
 
             //
-            // Pipeline
+            // ------------------------------------------------------------
+            // Graphics Pipeline
+            // ------------------------------------------------------------
+            //
+            // The graphics pipeline fixes the rules used to turn submitted
+            // vertices into pixels: shader stages, primitive topology,
+            // viewport, rasterization, multisampling, and color blending.
+            //
+            // This example uses no vertex buffer. The vertex shader obtains
+            // the vertex number from SV_VertexID and constructs the triangle.
+            //
+            // ------------------------------------------------------------
+            // Shader Modules: Slang -> SPIR-V -> Vulkan
+            // ------------------------------------------------------------
+            //
+            // The Slang compiler produces SPIR-V binaries during the build.
+            // Vulkan consumes SPIR-V through VkShaderModule objects. The
+            // shader modules are only needed while creating the pipeline, so
+            // they can be destroyed immediately after pipeline creation.
             //
 
             let vertex_name = CString::new(vertex_entry).unwrap();
@@ -87,6 +111,9 @@ impl Graphics {
 
             let stages = [vertex_stage, fragment_stage];
 
+            //
+            // IMPORTANT:
+            //
             // There are NO vertex attributes: SV_VertexID supplies the
             // vertex number.
             let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
@@ -160,7 +187,14 @@ impl Graphics {
                 .expect("graphics pipeline")[0];
 
             //
+            // ------------------------------------------------------------
             // Framebuffers
+            // ------------------------------------------------------------
+            //
+            // A framebuffer binds the render pass's attachment description
+            // to actual image views. There is one framebuffer per swapchain
+            // image, so the acquired image index selects the matching
+            // framebuffer during command recording.
             //
 
             let framebuffers = swapchain_image_views
